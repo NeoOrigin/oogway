@@ -1,0 +1,346 @@
+#!/usr/bin/env python
+#-------------------------------------------------------------------------------
+# Name:        profile
+# Purpose:
+#
+# Author:      Philip Bowditch
+#
+# Created:     06/03/2012
+# Copyright:   (c) Philip Bowditch 2012
+# Licence:     <your licence>
+#-------------------------------------------------------------------------------
+
+__author__ = "Philip Bowditch"
+
+from optparse import OptionParser
+from optparse import OptionGroup
+from datetime import datetime
+
+import sys
+import csv
+import gzip
+import zipfile
+
+import Profiler
+
+from Parsers.Csv_Parser    import *
+from Parsers.Html_Parser   import *
+from Parsers.Python_Parser import *
+from Parsers.Pickle_Parser import *
+
+from Format.Csv_Formatter    import *
+from Format.Html_Formatter   import *
+from Format.Json_Formatter   import *
+from Format.Python_Formatter import *
+from Format.Pickle_Formatter import *
+from Format.Table_Formatter  import *
+
+# Python 3 then Python 2 modules
+try:
+    from io import StringIO
+except ImportError:
+    try:
+        from cStringIO import StringIO
+    except ImportError:
+        import StringIO
+
+# If present, use psyco to accelerate the program
+try:    import psyco ; psyco.jit()
+except: pass
+
+def parse_option_as_bool( parser, option, default, name, exit_code ):
+    """
+    A helper utility for parsing incoming command line options.  This ensures the option is
+    a valid boolean, if not a standard error message is provided and the code exits
+    """
+    if option != None:
+        if isinstance( option, bool ):
+            return option
+
+        value = option.lower()
+        if   value in [ "true",  "yes", "on",  "y", "+" ]: return True
+        elif value in [ "false", "no",  "off", "n", "-" ]: return False
+        else:
+            parser.error( name + " option passed in '" + option + "' is not a valid boolean" )
+            sys.exit( exit_code )
+
+    return default
+
+def parse_option_as_int( parser, option, default, name, exit_code ):
+    """
+    A helper utility for parsing incoming command line options.  This ensures the option is
+    a valid integer, if not a standard error message is provided and the code exits
+    """
+    if option != None:
+        try:
+            return int( option )
+        except:
+            parser.error( name + " option passed in '" + option + "' is not a valid integer" )
+            sys.exit( exit_code )
+
+    return default
+
+def parse_option_as_string( parser, option, default, name, exit_code ):
+    """
+    A helper utility for parsing incoming command line options.  As command line options are
+    strings, this method is provided simply for consistency with the other methods, providing
+    a default if no options is given.
+    """
+    if option != None:
+        return option
+
+    return default
+
+def main():
+    """
+    Parses incoming arguments to the program, creates a Profiler object and parses
+    and profiles each record in turn before outputing any data
+    """
+
+    profiler = Profiler.Profiler()
+
+    parser   = OptionParser( "usage: %prog (--csv | --html | --python | --pickle | --json) [options] (- | filename)", version = "%prog : version 2.0.1" )
+
+    parser_group = OptionGroup( parser, "Input Formats", "These options specify how to parse csv input" )
+    parser_group.add_option( '--csv',    action="store_true", dest='csv',    help='Parse the input data in comma seperated value (csv) format'       )
+    parser_group.add_option( '--html',   action="store_true", dest='html',   help='Parse the input data in hyper text markup language (html) format' )
+    parser_group.add_option( '--python', action="store_true", dest='python', help='Parse the input data in python list format' )
+    parser_group.add_option( '--pickle', action="store_true", dest='pickle', help='Parse the input data in python pickle format' )
+    parser_group.add_option( '--json',   action="store_true", dest='json',   help='Parse the input data in json format' )
+
+    csv_group = OptionGroup( parser, "Csv Options", "These options specify how to parse csv input" )
+    csv_group.add_option(     '-n', '--sniff',           dest='sniff',            type="int", help='Autodetect csv parsing options from first (n) bytes'                                 )
+    csv_group.add_option(     '-b', '--buffer',          dest='buffer',           type="int", help='The maximum size any field can be (default=512KB)'                                   )
+    csv_group.add_option(     '-d', '--delimiter',       dest='delimiter',                    help='The field delimiter to parse with'                                                   )
+    csv_group.add_option(     '-t', '--terminator',      dest='lineterminator',               help='The character to use signifying end of record (currently ignored)'                   )
+    csv_group.add_option(     '-q', '--quote',           dest='quotechar',                    help='The quote character to use to enclose fields etc'                                    )
+    csv_group.add_option(     '-o', '--doublequote',     dest='doublequote',                  help='Set to 1 to escape quotes by double quoting them else 0 (default=0)'                 )
+    csv_group.add_option(     '-x', '--escape',          dest='escapechar',                   help='The escape character to use on delimiters within fields etc'                         )
+    csv_group.add_option(     '-w', '--whitespace',      dest='skipinitialspace',             help='Set to True to skip leading white space in a given field'                            )
+
+    output_group = OptionGroup( parser, "Output Options", "These options specify how to output the results" )
+    output_group.add_option(  '-l', '--limit',           dest='limit',            type="int", help='The limit in number of fields displayed in advanced stats (default=5)'               )
+    output_group.add_option(  '-P', '--Print',           dest='print_as',                     help='Determines how to output the results (python, basic, table, csv, html, pickle, json)'        )
+
+    sampling_group = OptionGroup( parser, "Sampling Options", "These options specify which input records to profile" )
+    sampling_group.add_option('-m', '--sample-size',     dest='sample_size',      type="int", help='Of the records read this determines the percentage to sample (default=100)'          )
+    sampling_group.add_option('-s', '--row-start',       dest='row_start_on',     type="int", help='The record number to start parsing on (default=1)'                                   )
+    sampling_group.add_option('-e', '--row-end',         dest='row_end_on',       type="int", help='The record number to stop parsing on (default=100)'                                  )
+    sampling_group.add_option('-c', '--row-increment',   dest='row_increment',    type="int", help='Use to jump rows to analyse, set to 2 to analyse every other row etc (default=1)'    )
+    sampling_group.add_option('-S', '--field-start',     dest='field_start_on',   type="int", help='The field number to start parsing on (default=1)'                                    )
+    sampling_group.add_option('-E', '--field-end',       dest='field_end_on',     type="int", help='The field number to stop parsing on'                                                 )
+    sampling_group.add_option('-I', '--field-increment', dest='field_increment',  type="int", help='Use to jump field to analyse, set to 2 to analyse every other field etc (default=1)' )
+
+    parser.add_option(        '-r', '--header',          dest='has_header',       type="int",    help='The line number of the header or 0 if not set (default=1)'                           )
+    parser.add_option(        '-u', '--null',            dest='null_value',                      help='The value to interpret as null (default='' blank fields)'                            )
+    parser.add_option(        '-a', '--default',         dest='default_value',                   help='The value to assign if the value is null'                                            )
+    parser.add_option(        '-k', '--quick',           dest='quick',      action="store_true", help='Specify to produce quicker yet possibly less accurate results'                       )
+    parser.add_option(        '-z', '--decompress',      dest='decompress', action="store_true", help='Specify to decompress input (not currently supported with stdin)'                    )
+
+    parser.add_option_group( csv_group      )
+    parser.add_option_group( output_group   )
+    parser.add_option_group( sampling_group )
+
+    (options, args) = parser.parse_args()
+
+    # Determine how to parse the input format
+    input_format = "csv"
+    format_count = 0
+    if options.csv    != None: format_count += 1
+    if options.json   != None: format_count += 1
+    if options.python != None: format_count += 1
+    if options.pickle != None: format_count += 1
+    if options.html   != None: format_count += 1
+
+    if format_count > 1:
+        parser.error( "You must specify either --csv OR --html OR --python OR --json but not a combination" )
+        sys.exit(1)
+    elif format_count == 0:      input_format = "csv"
+    elif options.csv    == True: input_format = "csv"
+    elif options.html   == True: input_format = "html"
+    elif options.python == True: input_format = "python"
+    elif options.pickle == True: input_format = "pickle"
+    elif options.json   == True: input_format = "json"
+
+    sample_size      = parse_option_as_int(    parser, options.sample_size,                           100,   "sample size",        3 )
+    row_start_on     = parse_option_as_int(    parser, options.row_start_on,                            1,   "row start",          4 )
+    row_end_on       = parse_option_as_int(    parser, options.row_end_on,                            100,   "row end",            5 )
+    row_increment    = parse_option_as_int(    parser, options.row_increment,                           1,   "row increment",      6 )
+    field_start_on   = parse_option_as_int(    parser, options.field_start_on,                          1,   "field start",        7 )
+    field_end_on     = parse_option_as_int(    parser, options.field_end_on,                         None,   "field end",          8 )
+    field_increment  = parse_option_as_int(    parser, options.field_increment,                         1,   "field increment",    9 )
+    buffer           = parse_option_as_int(    parser, options.buffer,                             524288,   "buffer",            10 )
+    limit            = parse_option_as_int(    parser, options.limit,                                   5,   "limit",             11 )
+    has_header       = parse_option_as_int(    parser, options.has_header,                              1,   "header",            12 )
+    print_as         = parse_option_as_string( parser, options.print_as,                          "basic",   "Print",             13 ).lower()
+    null_value       = parse_option_as_string( parser, options.null_value,                             "",   "null",              14 )
+    default_value    = parse_option_as_string( parser, options.default_value,                        None,   "default",           15 )
+    quick            = parse_option_as_bool(   parser, options.quick,                               False,   "quick",             16 )
+    decompress       = parse_option_as_bool(   parser, options.decompress,                          False,   "decompress",        17 )
+
+    if print_as not in [ "basic", "table", "csv", "html", "json", "python", "pickle" ]:
+        parser.error( "Print option passed in '" + print_as + "' is not a valid value" )
+        sys.exit(18)
+
+    # Try to protect from user error, we cannot read below line 1 so make it default
+    # Normalize so fields start at 1 not 0
+    if row_start_on   < 1:   row_start_on    = 1
+    if field_start_on > 0:   field_start_on -= 1
+    if buffer         < 1:   buffer          = 1
+    if sample_size    > 100: sample_size     = 100
+    if sample_size    < 0:   sample_size     = 0
+
+    # Some metrics output field values, this sets the max we are prepared to display
+    profiler.limit       = limit
+    profiler.quick       = quick
+    profiler.sample_size = sample_size
+
+    filename = None
+    f        = None
+
+    # If any arguments were given use it as a filename, if - was given then use stdin
+    if args == None or len( args ) <= 0 or args[0] == "-":
+        filename = "-"
+        f        = sys.stdin
+    else:
+        filename = args[0]
+
+        # Try reading as compressed gzip if flag specified
+        if decompress:
+            f  = gzip.open( filename, "rb" )
+            try:
+                test = f.readline()
+                f.rewind()
+            except Exception:
+                if zipfile.is_zipfile( filename ):
+                    f = zipfile.open( filename, "r" )
+                else:
+                    parser.error( "" )
+                    sys.exit(19)
+        else:
+            try:
+                f = open( filename, "r" )
+            except Exception:
+                sys.exit(20)
+
+    print( "-- Configuration ---------------------------------------------------" )
+    print( "Source           = " + repr( filename         ) )
+    print( "Start On         = " + repr( row_start_on     ) )
+    print( "End On           = " + repr( row_end_on       ) )
+    print( "Increment        = " + repr( row_increment    ) )
+    print( "Start On Field   = " + repr( field_start_on   ) )
+    print( "End On Field     = " + repr( field_end_on     ) )
+    print( "Sample Size (%)  = " + repr( sample_size      ) )
+    print( "Increment Field  = " + repr( field_increment  ) )
+    print( "Buffer Size      = " + repr( buffer           ) )
+    print( "Header           = " + repr( has_header       ) )
+    print( "Null Value       = " + repr( null_value       ) )
+    print( "Default Value    = " + repr( default_value    ) )
+    print( "Display Limit    = " + repr( limit            ) )
+    print( "Quick Mode       = " + repr( quick            ) )
+    print( "Input Format     = " + repr( input_format     ) )
+    print( "Output Format    = " + repr( print_as         ) )
+
+    parser = None
+    if   input_format == "html":   parser = Html_Parser(   f, buffer )
+    elif input_format == "python": parser = Python_Parser( f, buffer )
+    elif input_format == "pickle": parser = Pickle_Parser( f, buffer )
+    elif input_format == "json":   parser = Json_Parser(   f, buffer )
+    elif input_format == "csv":
+
+        # By default parse csv with excel dialect + overrides
+        dialect = csv.get_dialect( "excel" )
+
+        # If we are autodetecting format read the first few bytes from the file but make
+        # sure we reset back to the start of the stream of data
+        sniff = parse_option_as_int( parser, options.sniff, 0, "sniff", 1 )
+        if sniff > 0:
+            dialect = csv.Sniffer().sniff( f.read( sniff ) )
+            f.seek( 0 )
+
+        #
+        # Now we either use the default dialect or we have sniffed a new one.  We now assign default
+        # values to our fields and then set overrides if the user gave any
+        #
+        skipinitialspace = parse_option_as_bool(   parser, options.skipinitialspace, dialect.skipinitialspace,   "skipinitialspace",  21 )
+        doublequote      = parse_option_as_bool(   parser, options.doublequote,                         False,   "doublequote",       22 )
+        delimiter        = parse_option_as_string( parser, options.delimiter,               dialect.delimiter,   "delimiter",         23 )
+        lineterminator   = parse_option_as_string( parser, options.lineterminator,     dialect.lineterminator,   "lineterminator",    24 )
+        quotechar        = parse_option_as_string( parser, options.quotechar,               dialect.quotechar,   "quotechar",         25 )
+        escapechar       = parse_option_as_string( parser, options.escapechar,             dialect.escapechar,   "escapechar",        26 )
+
+        # etup the parser with our csv options
+        parser = Csv_Parser( f, buffer, delimiter, lineterminator, quotechar, doublequote, escapechar, skipinitialspace )
+
+        print( "Delimiter        = " + repr( delimiter        ) )
+        print( "Terminator       = " + repr( lineterminator   ) )
+        print( "Quote Character  = " + repr( quotechar        ) )
+        print( "Escape Character = " + repr( escapechar       ) )
+        print( "Whitespace       = " + repr( skipinitialspace ) )
+
+    print( "" )
+
+    # For performance reasons this identifies the first record we add
+    row_count = 0
+    line_num  = 0
+
+    for row in parser:
+        line_num += 1
+
+        # If we are looking for a header and we have found the line number then
+        # add the header
+        if has_header > 0 and has_header == line_num:
+            if field_end_on == None:
+                field_end_on = len( row )
+
+            profiler.set_field_names( row[field_start_on:field_end_on:field_increment] )
+        else:
+
+            # Process record if within bounds, exit as soon as required
+            if line_num >= row_start_on:
+
+                # If we have some data for the first time then we have a good idea
+                # how may fields are in the data, use this informtion to setup our arrays
+                # this may change in the future
+                if row_count == 0:
+                    num_fields = len( row[field_start_on:field_end_on:field_increment] )
+                    first_record = False
+                    profiler.set_null_values(    [ null_value    ] * num_fields )
+                    profiler.set_default_values( [ default_value ] * num_fields )
+
+                    # Specify max if we aren't limiting ourselves
+                    if field_end_on == None:
+                        field_end_on = len( row )
+
+                # Update row count and only analyse row if within our increment range
+                # and limit the fields to analyse based on start_on etc
+                row_count += 1
+                if ( row_count % row_increment ) == 0:
+                    profiler.add_record( row[field_start_on:field_end_on:field_increment] )
+
+            if row_end_on >= 0 and line_num >= row_end_on:
+                break
+
+    # Finalize the profiler to build summary statistics from accumulated values
+    profiler.finalize()
+
+    # Determine how to print, basic printing has no special format required
+    if print_as == "basic":
+        print( profiler )
+    else:
+        data = profiler.get_results_table()
+
+        fmtter = None
+
+        if   print_as == "table":  fmtter = Table_Formatter()
+        elif print_as == "python": fmtter = Python_Formatter()
+        elif print_as == "pickle": fmtter = Pickle_Formatter()
+        elif print_as == "csv":    fmtter = Csv_Formatter()
+        elif print_as == "html":   fmtter = Html_Formatter()
+        elif print_as == "json":   fmtter = Json_Formatter()
+
+        fmtter.write( data, sys.stdout )
+
+
+if __name__ == '__main__':
+    main()
